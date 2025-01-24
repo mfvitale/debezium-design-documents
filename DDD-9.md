@@ -201,16 +201,149 @@ We exclude more complex format like [OAS](https://swagger.io/specification/), al
 
 ## Generate descriptors
 
-Reuse of ConnectorMetadataProvider, ConnectorMetadata, ConnectorDescriptor, Field
+### Debezium schema generator
+The old UI used a json descriptor built by the `debezium-schema-generator`. The `SchemaGenerator` class based its generation on the following interfaces
 
-Pro -> Field has also the concept of deprecation
-Cons-> Custom components will not be automatically supported but users need to provide the descriptor.
+```java
+public interface ConnectorMetadataProvider {
 
-or 
+    ConnectorMetadata getConnectorMetadata();
+}
 
-use the ConfigDef and ConfigKey.
+public interface ConnectorMetadata {
 
-Pro -> Currently all the Kafka Connect components exposes the ConfigDef, there should just be homogenized putting
-that method in a common interface, so they can be easily discovered. Also, custom components will benefit from it.
+    ConnectorDescriptor getConnectorDescriptor();
 
-or a mix of both? Maybe using a more generic interface for discover components that provide configuration definition.
+    Field.Set getConnectorFields();
+}
+```
+Each connector needs to implement these two interfaces to provide the information required for the descriptor generation. 
+
+The `ConnectorDescriptor` class contains some basic information like the `className`, `version`, `displayName` and `id`.
+The `Field` class contains the information used to describe a configuration property. Below there is an extract of the properties of this class.
+
+```java
+    private final String name;
+    private final String displayName;
+    private final String desc;
+    private final Supplier<Object> defaultValueGenerator;
+    private final Validator validator;
+    private final Width width;
+    private final Type type;
+    private final Importance importance;
+    private final List<String> dependents;
+    private final Recommender recommender;
+    private final java.util.Set<?> allowedValues;
+    private final GroupEntry group;
+    private final boolean isRequired;
+    private final java.util.Set<String> deprecatedAliases;
+```
+
+| Pro                           | Cons                                                     |
+|-------------------------------|----------------------------------------------------------|
+| Alias and deprecation support | Requires change to the components code                   |
+| Decoupled from Kafka Connect  | Loose control on custom connectors, transformations, etc |
+
+
+### Kafka Connect data
+
+Every Kafka Connect components exposes the `ConfigDef` object that contains the definition of configuration property that the component declare. 
+A configuration is mapped in the `ConfigKey` class. 
+
+```java
+public static class ConfigKey {
+    public final String name;
+    public final Type type;
+    public final String documentation;
+    public final Object defaultValue;
+    public final Validator validator;
+    public final Importance importance;
+    public final String group;
+    public final int orderInGroup;
+    public final Width width;
+    public final String displayName;
+    public final List<String> dependents;
+    public final Recommender recommender;
+    public final boolean internalConfig;
+    public final String alternativeString;
+
+    //...
+}
+```
+
+| Pro                              | Cons                                        |
+|----------------------------------|---------------------------------------------|
+| Discoverability of components    | Coupled with Kafka Connect                  |
+| No change to the components code | Missing support for deprecation and aliases |
+
+The `Discoverability of components` requires an in-depth analysis. 
+The `ConfigDef config()` method is declared in different interfaces/classes, and so the discoverability means to look for all of that.  
+
+```java
+public abstract class Connector implements Versioned {
+    
+    /**
+     * Define the configuration for the connector.
+     * @return The ConfigDef for this connector; may not be null.
+     */
+    public abstract ConfigDef config();
+}
+
+public interface Converter {
+
+    /**
+     * Configuration specification for this converter.
+     * @return the configuration specification; may not be null
+     */
+    default ConfigDef config() {
+        return new ConfigDef();
+    }
+}
+
+public interface Transformation<R extends ConnectRecord<R>> extends Configurable, Closeable {
+
+    /** Configuration specification for this transformation. */
+    ConfigDef config();
+}
+
+public interface Predicate<R extends ConnectRecord<R>> extends Configurable, AutoCloseable {
+
+    /**
+     * Configuration specification for this predicate.
+     *
+     * @return the configuration definition for this predicate; never null
+     */
+    ConfigDef config();
+}
+```
+
+We could propose a KIP to move this method in a dedicated interface
+
+```java
+/**
+ * ConfigSpecifier has the sole responsibility of defining what configuration a component accepts
+ */
+public interface ConfigSpecifier {
+   
+    /** Configuration specification. */
+    ConfigDef config();
+}
+```
+
+to easily discover all classes that implements this interface. 
+
+### Considerations 
+
+The approach to use the `Kafka Connect` classes, even if it is coupled to it, offers more flexibility in supporting components outside Debezium.
+The only real cons is the missing of a deprecation and aliases support. Can we think to contribute and add the support to `ConfigKey`?
+
+Then the `debezium-schema-generator` could be modified to support the new format and how retrieve the components.
+
+## Storing descriptor
+
+Since the main user of that descriptor, as of now, will be the Debezium Platform, them cannot be got from a running debezium server instance,
+since the information contained in the description needs to be used during the creation of the Debezium Platform components (Source, Destination and Transformation).
+
+This requires to store/publish the generated descriptor somewhere. 
+
+
